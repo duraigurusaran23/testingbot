@@ -127,11 +127,11 @@ class WebsiteScraper:
 
         text = self.crawl_website(url, progress_callback, stop_check)
 
-        # Split text into chunks (optimized for speed)
+        # Split text into chunks (optimized for content preservation)
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Reduced for faster processing
-            chunk_overlap=50,  # Reduced overlap
-            separators=["\n\n", "\n", ". ", ": ", " ", ""]
+            chunk_size=800,  # Increased for better context preservation
+            chunk_overlap=100,  # Increased overlap for continuity
+            separators=["\n\n", "\nSkills\n", "\nCertifications\n", "\nProjects\n", "\nEducation\n", "\n", ". ", ": ", " ", ""]
         )
 
         chunks = splitter.split_text(text)

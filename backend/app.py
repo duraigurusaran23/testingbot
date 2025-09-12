@@ -1,25 +1,30 @@
+import streamlit as st
 from dotenv import load_dotenv
 import asyncio
 import nest_asyncio
 import os
 import time
+import shutil
+from pathlib import Path
 from datetime import datetime
-import streamlit as st
-from chunk_loader import load_processed_chunks, get_chunk_statistics
-from pdf_loader import load_pdfs  # Keep as fallback
+import pickle
+import json
+
+# LangChain imports
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
+
+# Custom loaders
+from chunk_loader import load_processed_chunks
 from scraper import WebsiteScraper
-import shutil
-from pathlib import Path
-import subprocess
 
-
-
+# -------------------------------
+# Setup
+# -------------------------------
 try:
     asyncio.get_running_loop()
 except RuntimeError:
@@ -29,6 +34,32 @@ except RuntimeError:
 nest_asyncio.apply()
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+st.set_page_config(page_title="Chatbot", page_icon="🤖", layout="centered")
+
+# -------------------------------
+# Session State Initialization
+# -------------------------------
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [{"role": "bot", "text": "👋 Hi! Enter `new + url` to start."}]
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+if "current_url" not in st.session_state:
+    st.session_state.current_url = None
+if "scraping" not in st.session_state:
+    st.session_state.scraping = False
+if "scraping_url" not in st.session_state:
+    st.session_state.scraping_url = None
+if "qa_chain" not in st.session_state:
+    st.session_state.qa_chain = None
+
+# -------------------------------
+# Utility Functions
+# -------------------------------
+def add_message(role, text):
+    st.session_state["messages"].append({"role": role, "text": text})
 
 def delete_existing_data():
     pdfs_dir = Path("../pdfs")
@@ -40,577 +71,615 @@ def delete_existing_data():
     pdfs_dir.mkdir(exist_ok=True)
     processed_dir.mkdir(exist_ok=True)
 
-
-
-
-st.set_page_config(page_title="Website Knowledge Chatbot", page_icon="💬", layout="wide")
-
-# Initialize session state
-if "processed" not in st.session_state:
-    st.session_state.processed = False
-if "current_url" not in st.session_state:
-    st.session_state.current_url = None
-if "scraping" not in st.session_state:
-    st.session_state.scraping = False
-
-# Header
-col_logo, col_title, col_actions = st.columns([0.1, 0.7, 0.2])
-with col_logo:
-    st.markdown("### 💬")
-with col_title:
-    st.markdown("### Website Knowledge Chatbot")
-    if st.session_state.current_url:
-        st.caption(f"Current site: {st.session_state.current_url}")
-    else:
-        st.caption("Enter 'new + URL' to scrape a website, or ask questions.")
-with col_actions:
-    if st.button("🧹 Clear chat", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.chat_history = []
-        st.rerun()
-
-# Handle scraping process
-if st.session_state.get("scraping", False):
-    st.session_state.stop_scraping = False
-    progress_bar = st.progress(0.01)
-    status_text = st.empty()
-    stop_button_placeholder = st.empty()
-
-    def progress_callback(p, s):
-        progress_bar.progress(max(p / 100, 0.01))
-        status_text.text(s)
-
-    def stop_check():
-        return st.session_state.get("stop_scraping", False)
-
-    url = st.session_state.scraping_url
-    delete_existing_data()
-
-    # Use direct chunking for faster processing
-    scraper = WebsiteScraper()
-    chunks = scraper.scrape_to_chunks(url, progress_callback, stop_check)
-
-    if stop_check():
-        st.warning("Scraping stopped. Processing partial data...")
-
-    # Save chunks directly without PDF processing
-    from datetime import datetime
-    import json
-    import pickle
-    from pathlib import Path
-
-    processed_dir = Path("../processed_data")
-    processed_dir.mkdir(exist_ok=True)
-
-    metadata = {
-        "processing_date": datetime.now().isoformat(),
-        "source_url": url,
-        "total_chunks": len(chunks),
-        "total_characters": sum(len(chunk) for chunk in chunks)
-    }
-
-    # Save chunks
-    chunks_file = processed_dir / "chunks.json"
-    with open(chunks_file, 'w', encoding='utf-8') as f:
-        json.dump({
-            "chunks": chunks,
-            "metadata": metadata
-        }, f, indent=2, ensure_ascii=False)
-
-    pickle_file = processed_dir / "chunks.pkl"
-    with open(pickle_file, 'wb') as f:
-        pickle.dump({
-            "chunks": chunks,
-            "metadata": metadata
-        }, f)
-
-    # Clear cache to ensure fresh data loading
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.session_state.processed = True
-    st.session_state.current_url = url
-    st.session_state.scraping = False
-    add_message("bot", f"✅ Successfully scraped and processed {url}. You can now ask questions about this website!")
-    st.rerun()
-
-model_option = "gemini-1.5-flash"
-
-
-
-
+# -------------------------------
+# Chatbot Initialization
+# -------------------------------
 @st.cache_data(show_spinner=False)
 def get_docs():
     """Load pre-processed chunks"""
-    status_placeholder = st.empty()
-
     try:
-        status_placeholder.info("📖 Loading pre-processed chunks...")
         docs = load_processed_chunks()
-
-        if docs:
-            status_placeholder.success("Bot is ready")
-            return docs
-        else:
-            status_placeholder.warning("⚠️ No pre-processed chunks found. Please scrape a website first by typing 'new + URL'")
-            return []
-
+        return docs if docs else []
     except Exception as e:
-        status_placeholder.error(f"❌ Error loading chunks: {str(e)}")
         return []
 
-docs = get_docs()
-global_chunks = docs
-
-
-
 @st.cache_resource
-def get_chain(selected_model):
+def get_chain(selected_model, docs):
     if not docs:
         return None
-
     try:
-        embed_progress = st.empty()
-        embed_status = st.empty()
-
-        embed_progress.progress(0.1)
-        embed_status.text("🔄 Creating embeddings…")
-
-        # Always try local embeddings first as primary method
-        embed_status.text("🔄 Using local embeddings (more reliable)…")
+        # Try local embeddings first
         try:
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            )
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             embedding_provider = "Local (Sentence Transformers)"
-            embed_status.text("✅ Local embeddings loaded successfully!")
         except Exception as local_e:
-            embed_status.error(f"❌ Failed to load local embeddings: {str(local_e)}")
-            embed_status.text("🔄 Trying Google API as fallback…")
-            try:
-                embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/embedding-001",
-                    google_api_key=GOOGLE_API_KEY
-                )
-                embedding_provider = "Google Gemini"
-                embed_status.text("✅ Google API embeddings loaded!")
-            except Exception as google_e:
-                embed_status.error(f"❌ Both embedding methods failed. Google API Error: {str(google_e)}")
-                raise google_e
-
-        embed_progress.progress(0.3)
-        embed_status.text("🔄 Building vector store…")
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=GOOGLE_API_KEY
+            )
+            embedding_provider = "Google Gemini"
 
         vector_store = FAISS.from_texts(docs, embeddings)
-
-        embed_progress.progress(0.7)
-        embed_status.text("🔄 Configuring retriever…")
-
-        retriever = vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}  # Reduced from 10 for faster retrieval
-        )
-
-        embed_progress.progress(0.9)
-        embed_status.text("🔄 Initializing chatbot…")
-
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 8})
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
         custom_prompt_template = """
-            You are a professional AI assistant that answers questions based solely on the scraped website content.
-            Follow these rules strictly:
+         # 🤖 Advanced Website Knowledge Assistant
 
-            1. ANSWER ONLY FROM CONTEXT:
-            - Use only the provided context to answer questions.
-            - If information is not in the context, respond: "I don't know. The information is not available in the provided website."
-            - Never make assumptions, guess, or use external knowledge.
+         You are an intelligent AI assistant specialized in website content analysis and Q&A. Your primary function is to help users understand and extract information from scraped website data.
 
-            2. NATURAL LANGUAGE UNDERSTANDING:
-            - Recognize synonyms and related terms:
-              * Leadership: CEO, Founder, Owner, President, Director, Executive, Head, Boss, Manager
-              * Team/People: Employees, Staff, Workers, Team members, Personnel, Associates
-              * Company: Organization, Firm, Business, Corporation, Enterprise
-              * Products/Services: Solutions, Offerings, Features, Capabilities
-              * Contact: Reach out, Get in touch, Connect, Email, Phone
-            - Understand context and intent behind questions
+         ## 🎯 CORE PRINCIPLES
 
-            3. CHAT HISTORY CONTEXT:
-            - Use previous conversation to understand follow-up questions
-            - If a question is vague, refer to the most recent relevant topic
-            - Maintain conversation continuity
+         ### 1. CONTEXT-ONLY ANSWERING
+         - **MANDATORY**: Answer ONLY using the provided website context
+         - **NEVER** use external knowledge, assumptions, or general information
+         - **DEFAULT RESPONSE** for unavailable information: "I don't know. The information is not available in the provided website content."
+         - **VERIFICATION**: Cross-reference information across multiple context chunks when possible
 
-            4. RESPONSE STYLE:
-            - Be concise but complete
-            - Stay focused on the question
-            - Use professional, business-appropriate language
-            - If question has multiple interpretations, clarify using context/history
+         ### 2. INTELLIGENT CONTENT RECOGNITION
+         **Synonyms & Related Terms:**
+         - **Leadership**: CEO, Founder, Owner, President, Director, Executive, Head, Boss, Manager, Chairperson
+         - **Team/People**: Employees, Staff, Workers, Team members, Personnel, Associates, Colleagues, Workforce
+         - **Company**: Organization, Firm, Business, Corporation, Enterprise, Startup, Agency, Consultancy
+         - **Products/Services**: Solutions, Offerings, Features, Capabilities, Platforms, Tools, Systems
+         - **Contact**: Reach out, Get in touch, Connect, Email, Phone, Message, Contact form
+         - **Skills/Abilities**: Expertise, Proficiency, Knowledge, Experience, Qualifications, Competencies
+         - **Certifications**: Certificates, Credentials, Qualifications, Awards, Achievements, Accreditations
+         - **Education**: Degree, Course, Training, Learning, Academic background, Qualifications
+         - **Experience**: Work history, Career, Professional background, Tenure, Employment
 
-            Context: {context}
-            Chat History: {chat_history}
-            Question: {question}
+         ### 3. SPECIALIZED CONTENT HANDLING
 
-            Answer:
-            """
+         **Skills Analysis:**
+         - List ALL technical skills mentioned (HTML, CSS, JavaScript, Python, AWS, React, Node.js, etc.)
+         - Include proficiency levels when specified (Beginner, Intermediate, Advanced, Expert)
+         - Group related skills (Frontend: HTML/CSS/JS, Backend: Python/Node.js, Cloud: AWS/GCP)
+         - Mention tools, frameworks, and technologies
 
+         **Certifications & Qualifications:**
+         - List complete certification names with providers
+         - Include dates, validity periods, and credential IDs when available
+         - Group by category (Technical, Professional, Industry-specific)
+         - Note any specializations or concentrations
 
+         **Company/Service Information:**
+         - Extract mission, vision, values, and company culture
+         - Identify products, services, and target markets
+         - Note unique selling propositions and competitive advantages
+         - Include pricing, packages, or service tiers when mentioned
+
+         ### 4. CONVERSATION INTELLIGENCE
+
+         **Chat History Integration:**
+         - Reference previous questions and answers for context
+         - Understand follow-up questions and clarifications
+         - Maintain conversation flow and topic continuity
+         - Avoid repeating information already provided
+
+         **Question Interpretation:**
+         - Recognize implicit questions and requests
+         - Handle multi-part questions systematically
+         - Provide comprehensive answers for broad queries
+         - Ask for clarification only when absolutely necessary
+
+         ### 5. RESPONSE OPTIMIZATION
+
+         **Content Structure:**
+         - **Headers**: Use clear, descriptive headers for organized responses
+         - **Lists**: Use bullet points or numbered lists for multiple items
+         - **Tables**: Use markdown tables for comparisons or structured data
+         - **Code**: Use code blocks for technical content, commands, or examples
+
+         **Professional Communication:**
+         - Use business-appropriate, professional language
+         - Be concise yet comprehensive - no unnecessary verbosity
+         - Maintain consistent tone throughout responses
+         - Use active voice and clear sentence structure
+
+         **Error Handling:**
+         - Gracefully handle incomplete or unclear context
+         - Provide partial information when available
+         - Suggest related topics or alternative questions
+         - Maintain helpful attitude even with limitations
+
+         ## 📋 RESPONSE GUIDELINES
+
+         ### For Skills/Certifications Questions:
+         ```
+         ## Technical Skills
+         - **Frontend Development**: HTML (90%), CSS (85%), JavaScript (80%)
+         - **Backend Development**: Python (85%), Node.js (75%), SQL (80%)
+         - **Cloud Platforms**: AWS (70%), Google Cloud (60%)
+
+         ## Certifications
+         - **AWS Certified Solutions Architect** - Amazon Web Services (2023)
+         - **Google Cloud Professional Developer** - Google Cloud (2023)
+         - **Certified Scrum Master** - Scrum Alliance (2022)
+         ```
+
+         ### For Company Information:
+         ```
+         ## Company Overview
+         [Company Name] is a [industry] company specializing in [services/products].
+
+         ## Key Services
+         - Service 1: [Description]
+         - Service 2: [Description]
+
+         ## Unique Value Proposition
+         [What makes them stand out]
+         ```
+
+         ### For General Questions:
+         - Provide direct, factual answers
+         - Include relevant context and details
+         - Reference specific sections or pages when possible
+         - Maintain objectivity and accuracy
+
+         ## 🔍 CONTEXT ANALYSIS FRAMEWORK
+
+         When analyzing context:
+         1. **Identify Key Sections**: Headers, navigation, main content areas
+         2. **Extract Structured Data**: Lists, tables, specifications
+         3. **Note Relationships**: How different pieces of information connect
+         4. **Prioritize Relevance**: Focus on information most relevant to the question
+         5. **Maintain Accuracy**: Only include information explicitly stated
+
+         ## 🚀 ADVANCED FEATURES
+
+         - **Multi-page Synthesis**: Combine information from different website sections
+         - **Temporal Awareness**: Note dates, timelines, and chronological information
+         - **Comparative Analysis**: Handle questions comparing different options or services
+         - **Requirements Matching**: Help users find services/products that match their needs
+
+         ---
+
+         **Context**: {context}
+         **Chat History**: {chat_history}
+         **Question**: {question}
+
+         **Answer**:
+         """
         CUSTOM_QUESTION_PROMPT = PromptTemplate.from_template(custom_prompt_template)
 
         qa_chain = ConversationalRetrievalChain.from_llm(
             llm=ChatGoogleGenerativeAI(
                 model=selected_model,
                 google_api_key=GOOGLE_API_KEY,
-                temperature=0.0,  # More focused and faster responses
-                max_tokens=300,  # Shorter responses for speed
+                temperature=0.0,
+                max_tokens=300,
                 max_retries=1
             ),
             retriever=retriever,
             memory=memory,
-            verbose=False,
             combine_docs_chain_kwargs={"prompt": CUSTOM_QUESTION_PROMPT}
         )
 
-        embed_progress.progress(1.0)
-        embed_status.success("✅ Chatbot ready!")
-        time.sleep(0.2)
-        embed_progress.empty()
-        embed_status.empty()
-
-        # Store embedding provider in session state
         st.session_state.embedding_provider = embedding_provider
-
         return qa_chain
     except Exception as e:
         st.error(f"Failed to initialize the chatbot: {str(e)}")
-        if "ResourceExhausted" in str(e) or "quota" in str(e).lower():
-            st.error("**API Quota Issue**: The embedding creation failed due to API limits. Try using a different API key or upgrading your Google AI plan.")
         return None
 
-qa_chain = get_chain(model_option)
-if qa_chain is None:
-    if docs:
-        st.error("Failed to initialize embeddings. This may be due to API quota limits. The app will use local embeddings if available.")
-        st.error("Please check your API keys or try again later.")
-    else:
-        st.error("No documents found. Please ensure PDFs are in the 'pdfs' directory and contain text.")
-    st.stop()
-
-
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-
-
-with st.sidebar:
-    st.markdown("## 📊 Data Status")
-    if st.session_state.processed:
-        stats = {}
-        try:
-            stats = get_chunk_statistics() or {}
-        except Exception:
-            stats = {}
-
-        st.metric("Chunks", value=stats.get("total_chunks", "—"))
-        st.metric("Characters", value=f"{stats.get('total_characters', 0):,}")
-        if st.session_state.current_url:
-            st.write(f"**Source:** {st.session_state.current_url}")
-    else:
-        st.info("No website scraped yet. Type 'new + URL' to get started.")
-
-    st.divider()
-    st.markdown("## ⚙️ Model")
-    st.write("**Provider:** Google Gemini")
-    st.write(f"**Model:** `{model_option}`")
-    st.caption("Optimized for factual, contextual answers.")
-
-    st.divider()
-    st.markdown("## 🔍 Embeddings")
-    if 'embedding_provider' in st.session_state:
-        st.write(f"**Provider:** {st.session_state.embedding_provider}")
-    else:
-        st.write("**Provider:** Local (Fast)")
-
-    st.divider()
-    st.markdown("### Usage Tips")
-    st.caption("• Type 'new + URL' to scrape a website")
-    st.caption("• Ask questions about the scraped content")
-    st.caption("• Answers are based only on website data")
-
-
-
-def now_str():
-    return datetime.now().strftime("%H:%M")
-
-def add_message(role, text):
-    st.session_state.messages.append({
-        "role": role,          
-        "text": text,
-        "ts": now_str()
-    })
-
+# -------------------------------
+# User Input Handling
+# -------------------------------
 def handle_user_query(user_input):
-    """Processes user input, gets a response, updates state."""
     if not user_input.strip():
         return
-
     add_message("user", user_input)
 
-    # Check if user wants to scrape a new website
-    if user_input.lower().startswith("new "):
-        url_part = user_input[4:].strip()
+    # Start new scraping if user inputs "new + url"
+    if user_input.lower().startswith("new"):
+        url_part = user_input[4:].strip().lstrip("+").strip()
         if url_part.startswith("http"):
-            # Start scraping process
             st.session_state.scraping = True
             st.session_state.scraping_url = url_part
-            add_message("bot", f"🔄 Starting to scrape {url_part}... Please wait.")
-            st.rerun()
         else:
-            add_message("bot", "Please provide a valid URL starting with http:// or https://")
+            add_message("bot", "⚠️ Please provide a valid URL starting with http:// or https://")
         return
 
-    # If no data is processed yet, prompt user to scrape a site
+    # If data not processed yet
     if not st.session_state.processed:
-        add_message("bot", "Please scrape a website first by typing 'new + URL' (e.g., 'new https://example.com')")
+        add_message("bot", "Please scrape a website first by typing 'new + URL'")
         return
 
-    with st.spinner("🔍 Searching documents…"):
-        try:
-            time.sleep(0.1)  # Reduced delay for faster response
+    # Query the QA chain
+    try:
+        result = st.session_state.qa_chain.invoke({
+            "question": user_input,
+            "chat_history": st.session_state.chat_history
+        })
+        answer = result.get("answer", "I couldn't generate a response.")
+        add_message("bot", answer)
+        st.session_state.chat_history.append((user_input, answer))
+    except Exception as e:
+        add_message("bot", f"⚠️ Error generating response: {str(e)}")
 
-            with st.spinner("🤖 Generating response…"):
-                result = qa_chain.invoke({
-                    "question": user_input,
-                    "chat_history": st.session_state.get("chat_history", [])
-                })
-                answer = result.get("answer", "I couldn't generate a response.")
+# -------------------------------
+# Scraping Logic
+# -------------------------------
+if st.session_state.scraping and st.session_state.scraping_url:
+    url = st.session_state.scraping_url
+    delete_existing_data()
+    scraper = WebsiteScraper()
+    chunks = scraper.scrape_to_chunks(url, lambda p,s: None, lambda: False)
 
-            add_message("bot", answer)
-            st.session_state.chat_history = st.session_state.get("chat_history", []) + [(user_input, answer)]
-        except Exception as e:
-            error_msg = "Sorry, I encountered an error while processing your request."
-            if "ResourceExhausted" in str(e) or "quota" in str(e).lower():
-                error_msg = "⚠️ **API Quota Exceeded**: You've hit the API limit. Please wait or upgrade your plan."
-            else:
-                error_msg += f"\n\nDetails: {str(e)}"
-            add_message("bot", error_msg)
+    processed_dir = Path("../processed_data")
+    processed_dir.mkdir(exist_ok=True)
+    metadata = {
+        "processing_date": datetime.now().isoformat(),
+        "source_url": url,
+        "total_chunks": len(chunks),
+        "total_characters": sum(len(c) for c in chunks)
+    }
 
+    with open(processed_dir / "chunks.json", 'w', encoding='utf-8') as f:
+        json.dump({"chunks": chunks, "metadata": metadata}, f, indent=2, ensure_ascii=False)
+    with open(processed_dir / "chunks.pkl", 'wb') as f:
+        pickle.dump({"chunks": chunks, "metadata": metadata}, f)
 
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state.processed = True
+    st.session_state.current_url = url
+    st.session_state.scraping = False
+    add_message("bot", f"✅ Successfully scraped and processed {url}. You can now ask questions!")
+    st.rerun()
+
+# -------------------------------
+# Load docs and initialize QA chain
+# -------------------------------
+docs = get_docs()
+if docs:
+    st.session_state.qa_chain = get_chain("gemini-1.5-flash", docs)
+
+# -------------------------------
+# Professional Page UI
+# -------------------------------
 
 st.markdown("""
-    <style>
-        /* Global */
-        .stApp {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-        }
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
-        /* Main container */
-        .main .block-container {
-            padding: 1rem 2rem;
-            max-width: 1000px;
-        }
+/* Global Styles - 8-point grid system */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
 
-        /* Header styling */
-        .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
-            color: #ffffff;
-            font-weight: 600;
-        }
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f5f7fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #000000;
+}
 
-        /* Chat shell */
-        .chat-shell {
-            max-width: 900px;
-            margin: 0 auto;
-            border-radius: 20px;
-            background: #FFFFFF;
-            border: 1px solid #E6E8ED;
-            display: flex;
-            flex-direction: column;
-            height: calc(100vh - 180px);
-            box-shadow: 0 8px 32px rgba(0,0,0,0.12);
-            overflow: hidden;
-        }
+/* Main App Container */
+.stApp {
+    background: transparent !important;
+    max-width: 100% !important;
+}
 
-        /* Top bar */
-        .chat-topbar {
-            padding: 16px 20px;
-            border-bottom: 1px solid #E9EEF5;
-            display: flex; align-items: center; justify-content: space-between;
-            position: sticky; top: 0; background: #FFFFFF; z-index: 10;
-            border-top-left-radius: 20px; border-top-right-radius: 20px;
-        }
-        .chat-title {
-            font-weight: 700;
-            color: #1f2937;
-            font-size: 1.1rem;
-        }
+/* Center everything perfectly */
+.main .block-container {
+    padding: 0 !important;
+    max-width: none !important;
+    display: flex !important;
+    justify-content: center !important;
+    align-items: center !important;
+    min-height: 100vh !important;
+}
 
-        /* Scrollable history */
-        .chat-history {
-            flex: 1;
-            overflow-y: auto;
-            padding: 20px 18px 10px 18px;
-            display: flex; flex-direction: column; gap: 12px;
-            scroll-behavior: smooth;
-            background: #fafafa;
-        }
+/* Modern Chat Container */
+.chat-container {
+    width: 448px; /* 56 * 8px */
+    height: 672px; /* 84 * 8px */
+    background: #FFFFFF;
+    border-radius: 24px; /* 3 * 8px */
+    border: 1px solid #e1e5e9;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1), 0 8px 16px rgba(0, 0, 0, 0.06);
+}
 
-        /* Message rows */
-        .msg-row {
-            display: flex;
-            gap: 10px;
-            align-items: flex-end;
-            animation: fadeIn 0.3s ease-in;
-        }
-        .msg-row.user { justify-content: flex-end; }
-        .msg-row.bot { justify-content: flex-start; }
+/* Header */
+.chat-header {
+    padding: 24px; /* 3 * 8px */
+    background: #f8fafc;
+    border-bottom: 1px solid #e1e5e9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px; /* 1.5 * 8px */
+}
 
-        /* Avatars */
-        .avatar {
-            width: 32px; height: 32px; border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 14px; background: #EEF2FF; border: 2px solid #E0E7FF;
-            color: #3F51B5; flex-shrink: 0;
-            font-weight: 600;
-        }
-        .avatar.user {
-            background: linear-gradient(135deg, #10b981, #059669);
-            border-color: #047857;
-            color: white;
-        }
+.chat-title {
+    font-size: 22px; /* Header title size */
+    font-weight: 600; /* Semi-Bold */
+    margin: 0;
+    color: #1a202c;
+}
 
-        /* Bubbles */
-        .bubble {
-            max-width: 75%;
-            padding: 12px 16px;
-            border-radius: 18px;
-            line-height: 1.6;
-            font-size: 0.95rem;
-            word-wrap: break-word; white-space: pre-wrap;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-        }
-        .bot .bubble {
-            background: #FFFFFF; color: #374151; border: 1px solid #E5E7EB;
-            border-bottom-left-radius: 6px;
-        }
-        .user .bubble {
-            background: linear-gradient(135deg, #10b981, #059669); color: #FFFFFF;
-            border-bottom-right-radius: 6px;
-        }
+.bot-icon {
+    width: 32px; /* 4 * 8px */
+    height: 32px; /* 4 * 8px */
+    background: #007BFF;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    color: #ffffff;
+    box-shadow: 0 2px 8px rgba(0, 123, 255, 0.2);
+}
 
-        /* Timestamp */
-        .ts {
-            font-size: 0.75rem; color: #9CA3AF; margin: 0 8px;
-            font-weight: 500;
-        }
+/* Scrollable Messages Area */
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px; /* 3 * 8px */
+    scroll-behavior: smooth;
+    display: flex;
+    flex-direction: column;
+    gap: 16px; /* 2 * 8px */
+}
 
-        /* Bottom input bar */
-        .input-bar {
-            border-top: 1px solid #E9EEF5;
-            padding: 12px 18px;
-            background: #FFFFFF;
-            position: sticky; bottom: 0; z-index: 10;
-            border-bottom-left-radius: 20px; border-bottom-right-radius: 20px;
-        }
-        .input-bar .stTextInput > div > div {
-            border-radius: 25px !important;
-            border: 2px solid #E5E7EB !important;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06) !important;
-            transition: all 0.2s ease;
-        }
-        .input-bar .stTextInput > div > div:focus-within {
-            border-color: #10b981 !important;
-            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.1) !important;
-        }
-        .send-row .stButton>button {
-            height: 44px; border-radius: 22px;
-            border: 2px solid #10b981;
-            background: linear-gradient(135deg, #10b981, #059669);
-            color: white;
-            font-weight: 600;
-            transition: all 0.2s ease;
-        }
-        .send-row .stButton>button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
-        }
+/* Message Bubbles */
+.message {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px; /* 1 * 8px */
+    animation: slideIn 0.3s ease-out;
+    width: 100%;
+}
 
-        /* Scrollbar */
-        .chat-history::-webkit-scrollbar { width: 6px; }
-        .chat-history::-webkit-scrollbar-thumb {
-            background: #CBD5E1; border-radius: 3px;
-        }
-        .chat-history::-webkit-scrollbar-thumb:hover {
-            background: #94A3B8;
-        }
+.message.bot {
+    justify-content: flex-start;
+}
 
-        /* Animations */
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
+.message.user {
+    justify-content: flex-end;
+}
 
-        /* Sidebar improvements */
-        .stSidebar {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-        }
-    </style>
+.message-avatar {
+    width: 32px; /* 4 * 8px */
+    height: 32px; /* 4 * 8px */
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+}
+
+.message.bot .message-avatar {
+    background: #F0F2F5;
+    color: #666666;
+}
+
+.message.user .message-avatar {
+    background: #007BFF;
+    color: #ffffff;
+}
+
+.message-bubble {
+    max-width: 320px; /* 40 * 8px */
+    padding: 12px 16px; /* 1.5 * 8px, 2 * 8px */
+    border-radius: 16px; /* 2 * 8px */
+    font-size: 16px; /* Chat message text size */
+    line-height: 1.4;
+    word-wrap: break-word;
+    position: relative;
+    color: #000000;
+}
+
+.message.bot .message-bubble {
+    background: #F0F2F5;
+    border-bottom-left-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.message.user .message-bubble {
+    background: #D6EFFF;
+    border-bottom-right-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+/* Input Footer */
+.input-footer {
+    padding: 24px; /* 3 * 8px */
+    background: #f8fafc;
+    border-top: 1px solid #e1e5e9;
+}
+
+.input-row {
+    display: flex;
+    gap: 16px; /* 2 * 8px */
+    align-items: center;
+}
+
+.input-row .stTextInput > div > div > input {
+    border-radius: 24px !important; /* 3 * 8px */
+    border: 2px solid #d1d5db !important;
+    padding: 12px 20px !important; /* 1.5 * 8px, 2.5 * 8px */
+    font-size: 16px !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    transition: all 0.2s ease !important;
+    flex: 1 !important;
+}
+
+.input-row .stTextInput > div > div > input::placeholder {
+    color: #9ca3af !important;
+}
+
+.input-row .stTextInput > div > div > input:focus {
+    border-color: #007BFF !important;
+    background: #ffffff !important;
+    box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1) !important;
+}
+
+.input-row .stButton > button {
+    width: 48px !important; /* 6 * 8px */
+    height: 48px !important; /* 6 * 8px */
+    border-radius: 50% !important;
+    background: #007BFF !important;
+    border: none !important;
+    cursor: pointer !important;
+    transition: all 0.2s ease !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-shadow: 0 4px 12px rgba(0, 123, 255, 0.3) !important;
+    font-size: 20px !important;
+    line-height: 1 !important;
+    padding: 0 !important;
+}
+
+.input-row .stButton > button:hover {
+    background: #0056CC !important;
+    transform: scale(1.05) !important;
+    box-shadow: 0 6px 16px rgba(0, 123, 255, 0.4) !important;
+}
+
+.input-row .stButton > button:active {
+    transform: scale(0.95) !important;
+}
+
+/* Scrollbar Styling */
+.chat-messages::-webkit-scrollbar {
+    width: 8px; /* 1 * 8px */
+}
+
+.chat-messages::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+}
+
+.chat-messages::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+}
+
+.chat-messages::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.5);
+}
+
+/* Animations */
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Hide Streamlit elements */
+.stTextInput, .stButton, .stForm {
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+/* Responsive Design */
+@media (max-width: 480px) {
+    .chat-container {
+        width: 95vw !important;
+        height: 85vh !important;
+        margin: 16px !important; /* 2 * 8px */
+    }
+
+    .chat-header {
+        padding: 16px !important; /* 2 * 8px */
+    }
+
+    .chat-title {
+        font-size: 18px !important;
+    }
+
+    .chat-messages {
+        padding: 16px !important; /* 2 * 8px */
+    }
+
+    .input-footer {
+        padding: 16px !important; /* 2 * 8px */
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Header - Always visible
+st.markdown("""
+    <div class="chat-header">
+        <div class="bot-icon">🤖</div>
+        <h1 class="chat-title">AI Chat Assistant</h1>
+    </div>
+""", unsafe_allow_html=True)
+
+# Messages Area
+st.markdown('<div class="chat-messages" id="chat-messages">', unsafe_allow_html=True)
+
+for msg in st.session_state["messages"]:
+    role_class = "bot" if msg["role"] == "bot" else "user"
+    avatar_icon = "🤖" if msg["role"] == "bot" else "👤"
+    st.markdown(f"""
+        <div class="message {role_class}">
+            <div class="message-avatar">{avatar_icon}</div>
+            <div class="message-bubble">{msg['text']}</div>
+        </div>
     """, unsafe_allow_html=True)
 
+st.markdown('</div>', unsafe_allow_html=True)
 
+with st.form(key="chat_form", clear_on_submit=True):
+    st.markdown('<div class="input-row">', unsafe_allow_html=True)
+    col1, col2 = st.columns([1, 0.1])
+    with col1:
+        user_input = st.text_input(
+            "Message",
+            key="user_input_box",
+            placeholder="Ask me anything...",
+            label_visibility="collapsed"
+        )
+    with col2:
+        submitted = st.form_submit_button("✈️")
+    st.markdown('</div>', unsafe_allow_html=True)
 
+    if submitted and user_input:
+        handle_user_query(user_input)
+        # Removed st.rerun() to prevent UI blinking
 
+st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div id="chat-history" class="chat-history">', unsafe_allow_html=True)
-for msg in st.session_state.messages:
-    role = msg.get("role", "bot")
-    text = msg.get("text", "")
-    ts = msg.get("ts", now_str())
-    is_user = role == "user"
-    avatar = "🙋" if is_user else "🤖"
-    row_class = "user" if is_user else "bot"
-    st.markdown(
-        f"""
-        <div class="msg-row {row_class}">
-            {'<div class="avatar user">🙋</div>' if is_user else '<div class="avatar">🤖</div>'}
-            <div class="bubble">{text}</div>
-            <div class="ts">{ts}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
 
+# Auto-scroll JavaScript
+st.markdown("""
+<script>
+function scrollToBottom() {
+    const chatMessages = document.getElementById('chat-messages');
+    if (chatMessages) {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+}
 
+// Scroll immediately and after a short delay
+scrollToBottom();
+setTimeout(scrollToBottom, 100);
 
-st.markdown('<div class="input-bar">', unsafe_allow_html=True)
-with st.form("chat-input-form", clear_on_submit=True):
-    input_cols = st.columns([1, 0.12])
-    user_text = input_cols[0].text_input(
-        "Ask a question:",
-        key="user_input_box",
-        placeholder="Type your message…",
-        label_visibility="collapsed",
-    )
-    submitted = input_cols[1].form_submit_button("Send ➤")
-    if submitted and user_text:
-        handle_user_query(user_text)
-        st.rerun()
-st.markdown("</div>", unsafe_allow_html=True)
-
-
-st.markdown(
-    """
-    <script>
-        const hist = window.parent.document.querySelector('#chat-history');
-        if (hist) { hist.scrollTop = hist.scrollHeight; }
-    </script>
-    """,
-    unsafe_allow_html=True
-)
-
-st.markdown("</div>", unsafe_allow_html=True)
+// Also scroll on window resize
+window.addEventListener('resize', scrollToBottom);
+</script>
+""", unsafe_allow_html=True)
