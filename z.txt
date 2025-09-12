@@ -1,0 +1,7 @@
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+pip install streamlit langchain google-generativeai PyPDF2 faiss-cpu python-dotenv
+pip install -U langchain-community
+
+my-api-key=AIzaSyCE5C9vEb1pCHIkKtIkP56IERKsOHm1rNg

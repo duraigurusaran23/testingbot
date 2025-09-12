@@ -1,0 +1,85 @@
+Git Command Line Guide (Detailed)
+
+------------------------------------------------------------------------
+
+🔹 Case A: Upload a New Project (Fresh Repo)
+
+    # 1. Go to your project folder
+    cd path/to/your/project
+
+    # 2. Initialize Git
+    git init
+
+    # 3. Create a .gitignore file to avoid uploading venv, __pycache__, etc.
+    # (Open any editor and paste the standard Python .gitignore content)
+
+    # 4. Stage all files (except ignored ones)
+    git add .
+
+    # 5. Commit the files
+    git commit -m "Initial commit"
+
+    # 6. Connect your local repo with the new GitHub repo
+    git remote add origin https://github.com/your-username/new-repo-name.git
+
+    # 7. Rename branch to 'main'
+    git branch -M main
+
+    # 8. Push project to GitHub
+    git push -u origin main
+
+------------------------------------------------------------------------
+
+🔹 Case B: Update an Existing Project (New Folder or Files Added)
+
+    # 1. Go to your existing project folder
+    cd path/to/your/existing-project
+
+    # 2. Stage all changes (new folder, modified files, deleted files)
+    git add .
+
+    # 3. Commit the update with a message
+    git commit -m "Added new folder and updated files"
+
+    # 4. Push changes to GitHub
+    git push origin main
+
+------------------------------------------------------------------------
+
+🔹 .gitignore (Standard for Python Projects)
+
+    # Virtual environment
+    venv/
+    .venv/
+
+    # Python cache
+    __pycache__/
+    *.pyc
+    *.pyo
+    *.pyd
+
+    # IDE / Editor settings
+    .idea/
+    .vscode/
+    .DS_Store
+
+    # Build / Dist files
+    build/
+    dist/
+    *.egg-info/
+
+------------------------------------------------------------------------
+
+🔹 Useful Extra Commands
+
+    # Check which files are staged / unstaged / untracked
+    git status
+
+    # See commit history
+    git log
+
+    # If you accidentally staged files and want to unstage them
+    git reset
+
+    # If you want to remove a file from Git but keep it locally
+    git rm --cached filename

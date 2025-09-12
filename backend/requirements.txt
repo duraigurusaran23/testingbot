@@ -1,0 +1,15 @@
+streamlit
+python-dotenv
+PyPDF2
+langchain
+langchain-google-genai
+faiss-cpu
+nest_asyncio
+google-generativeai
+langchain-community==0.3.0
+requests
+beautifulsoup4
+lxml
+reportlab
+sentence-transformers
+
