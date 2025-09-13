@@ -221,6 +221,7 @@ def get_chain(selected_model, docs):
 
 
          ### For Company Information:
+
          ## Company Overview
          [Company Name] is a [industry] company specializing in [services/products].
 
