@@ -35,6 +35,18 @@ nest_asyncio.apply()
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
+API_KEYS = [
+    'AIzaSyDDEBszT3jzbD7X5DQaG0VyEgOuGINEU4M',
+    'AIzaSyAD8hLxcdnrC-_lZr4eJPNU_VvGfrbFPBU',
+    'AIzaSyBTjNLOgw-KWyYVto1qUnZkxxrUbjCJkMk',
+    'AIzaSyAx6kiWvvKGrGaHAf1e1pCI8CKDgLvFSEU'
+]
+
+if "current_key_index" not in st.session_state:
+    st.session_state.current_key_index = 0
+
+GOOGLE_API_KEY = API_KEYS[st.session_state.current_key_index]
+
 st.set_page_config(page_title="Chatbot", page_icon="🤖", layout="centered")
 
 # -------------------------------
@@ -71,6 +83,22 @@ def delete_existing_data():
     pdfs_dir.mkdir(exist_ok=True)
     processed_dir.mkdir(exist_ok=True)
 
+def switch_key():
+    st.session_state.current_key_index = (st.session_state.current_key_index + 1) % len(API_KEYS)
+    global GOOGLE_API_KEY
+    GOOGLE_API_KEY = API_KEYS[st.session_state.current_key_index]
+    st.cache_resource.clear()
+    docs = get_docs()
+    if docs:
+        st.session_state.qa_chain = get_chain("gemini-1.5-flash", docs)
+
+def update_env_with_current_key():
+    with open('.env', 'w') as f:
+        f.write(f'GOOGLE_API_KEY={API_KEYS[st.session_state.current_key_index]}\n')
+        for i, key in enumerate(API_KEYS):
+            if i != st.session_state.current_key_index:
+                f.write(f'# {key}\n')
+
 # -------------------------------
 # Chatbot Initialization
 # -------------------------------
@@ -100,7 +128,7 @@ def get_chain(selected_model, docs):
             embedding_provider = "Google Gemini"
 
         vector_store = FAISS.from_texts(docs, embeddings)
-        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 8})
+        retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 50, "fetch_k": 100})
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
         custom_prompt_template = """
@@ -182,23 +210,17 @@ def get_chain(selected_model, docs):
          - Suggest related topics or alternative questions
          - Maintain helpful attitude even with limitations
 
+         **Greeting Handling:**
+         - For very short inputs that are purely greetings like "hi", "hello", "hey", "good morning", respond with a friendly receptionist-style greeting
+         - Examples: "Hello! How can I help you today?" or "Hi there! What can I assist you with regarding the company?"
+         - For questions or longer inputs, always answer based on context
+         - Do not provide company information in greetings unless specifically asked
+         - Keep responses warm and welcoming only for clear greetings
+
          ## 📋 RESPONSE GUIDELINES
 
-         ### For Skills/Certifications Questions:
-         ```
-         ## Technical Skills
-         - **Frontend Development**: HTML (90%), CSS (85%), JavaScript (80%)
-         - **Backend Development**: Python (85%), Node.js (75%), SQL (80%)
-         - **Cloud Platforms**: AWS (70%), Google Cloud (60%)
-
-         ## Certifications
-         - **AWS Certified Solutions Architect** - Amazon Web Services (2023)
-         - **Google Cloud Professional Developer** - Google Cloud (2023)
-         - **Certified Scrum Master** - Scrum Alliance (2022)
-         ```
 
          ### For Company Information:
-         ```
          ## Company Overview
          [Company Name] is a [industry] company specializing in [services/products].
 
@@ -264,10 +286,19 @@ def get_chain(selected_model, docs):
 # -------------------------------
 # User Input Handling
 # -------------------------------
-def handle_user_query(user_input):
+def handle_user_query(user_input, retry_count=0):
     if not user_input.strip():
         return
-    add_message("user", user_input)
+
+    # Clear chat history if user inputs "clear"
+    if user_input.strip().lower() == "clear":
+        st.session_state.chat_history = []
+        st.session_state["messages"] = [{"role": "bot", "text": "👋 Hi! Enter `new + url` to start."}]
+        add_message("bot", "Chat history cleared.")
+        return
+
+    if retry_count == 0:  # Only add message on first attempt
+        add_message("user", user_input)
 
     # Start new scraping if user inputs "new + url"
     if user_input.lower().startswith("new"):
@@ -291,10 +322,20 @@ def handle_user_query(user_input):
             "chat_history": st.session_state.chat_history
         })
         answer = result.get("answer", "I couldn't generate a response.")
-        add_message("bot", answer)
+        if retry_count == 0:
+            add_message("bot", answer)
+        else:
+            add_message("bot", f"Switched to new API key. {answer}")
         st.session_state.chat_history.append((user_input, answer))
+        update_env_with_current_key()  # Update .env with working key
     except Exception as e:
-        add_message("bot", f"⚠️ Error generating response: {str(e)}")
+        error_str = str(e).lower()
+        if ("rate limit" in error_str or "quota" in error_str or "resource exhausted" in error_str) and retry_count < len(API_KEYS) - 1:
+            print("api key rate finished")
+            switch_key()
+            handle_user_query(user_input, retry_count + 1)
+        else:
+            add_message("bot", f"⚠️ Error generating response: {str(e)}")
 
 # -------------------------------
 # Scraping Logic
@@ -324,6 +365,9 @@ if st.session_state.scraping and st.session_state.scraping_url:
     st.session_state.processed = True
     st.session_state.current_url = url
     st.session_state.scraping = False
+    # Clear previous company history when new URL is entered
+    st.session_state.chat_history = []
+    st.session_state["messages"] = []
     add_message("bot", f"✅ Successfully scraped and processed {url}. You can now ask questions!")
     st.rerun()
 
@@ -659,7 +703,7 @@ with st.form(key="chat_form", clear_on_submit=True):
 
     if submitted and user_input:
         handle_user_query(user_input)
-        # Removed st.rerun() to prevent UI blinking
+        st.rerun()
 
 st.markdown('</div>', unsafe_allow_html=True)
 

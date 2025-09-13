@@ -38,6 +38,9 @@ class WebsiteScraper:
             lines = (line.strip() for line in text.splitlines())
             text = "\n".join(line for line in lines if line)
 
+            # Clean encoding issues
+            text = text.encode('utf-8', errors='ignore').decode('utf-8')
+
             return text
         except Exception as e:
             print(f"Failed to scrape {url}: {e}")
